@@ -1,0 +1,41 @@
+name: pointhub-backend-2
+
+services:
+  # Platform lab CSMS. Shared chargers stay on Power Hub OCPP; this host uses proxy/bridge.
+  app:
+    build: .
+    container_name: pointhub-backend-2
+    environment:
+      PORT: ${PORT:-3037}
+      WS_PATH: ${WS_PATH:-/ocpp}
+      BRIDGE_PATH: ${BRIDGE_PATH:-/bridge}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-60}
+      PUBLIC_URL: ${PUBLIC_URL:-https://api-dev.pointhub.io}
+      EV_HUB_WS_BASE: ${EV_HUB_WS_BASE:-}
+      EV_HUB_BRIDGE_URL: ${EV_HUB_BRIDGE_URL:-}
+      EV_HUB_PROXY_URL: ${EV_HUB_PROXY_URL:-https://beta.power-hub.app}
+      EV_HUB_PROVIDER: ${EV_HUB_PROVIDER:-virtual-server}
+      EV_HUB_PLATFORM_KEY: ${EV_HUB_PLATFORM_KEY:-}
+      SIMULATOR_MOCK_PASSWORD: ${SIMULATOR_MOCK_PASSWORD:-simulator-mock-1}
+      PRICE_PER_KWH: ${PRICE_PER_KWH:-500}
+    ports:
+      - "${PORT:-3037}:${PORT:-3037}"
+    networks:
+      - virtual-network
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: virtual-ocpp-cloudflare
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    networks:
+      - virtual-network
+    restart: unless-stopped
+    depends_on:
+      - app
+
+networks:
+  virtual-network:
+    driver: bridge
