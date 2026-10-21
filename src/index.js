@@ -149,11 +149,11 @@ function evHubBridgeUrl() {
 }
 
 function evHubBridgeConnectUrl() {
+  // Bridge is URL-only — do not append ?provider=
   const base = evHubBridgeUrl();
-  const provider = `${EV_HUB_PROVIDER || ""}`.trim();
-  if (!provider) return base;
+  if (!EV_HUB_PLATFORM_KEY) return base;
   const url = new URL(base);
-  url.searchParams.set("provider", provider);
+  url.searchParams.set("apiKey", EV_HUB_PLATFORM_KEY);
   return url.toString();
 }
 
@@ -163,15 +163,23 @@ let evHubReconnectTimer = null;
 const evHubPending = new Map();
 
 function handleEvHubEvent(msg) {
-  const event = `${msg.event || ""}`.trim(); 
+  const event = `${msg.event || ""}`.trim();
   const data = msg.data && typeof msg.data === "object" ? msg.data : {};
-  if (
-    event === "charger.meterValues" ||
-    event === "charger.startTransaction" ||
-    event === "charger.stopTransaction"
-  ) {
-    ingestMeterEvent(event, data);
+  if (event === "platform.whoami" || event === "csms.chargers") {
+    const chargers = Array.isArray(data.chargers) ? data.chargers : [];
+    const summary = chargers
+      .map((row) => `${row.chargePointId || "?"}:${row.available || row.online ? "up" : "down"}`)
+      .join(", ");
+    log(
+      "centralizer",
+      "·",
+      `ev-hub ${event} requestedBy=${data.requestedBy || EV_HUB_PROVIDER || ""} [${summary || "none"}]`,
+    );
+    if (event === "csms.chargers") ingestCsmsChargers(data.chargers);
+    return;
   }
+  // Master OCPP events from Power Hub /bridge (status, boot, meters, …)
+  ingestEvHubChargerEvent(event, data);
 }
 
 function failEvHubPending(error) {
@@ -196,16 +204,36 @@ function ensureEvHubSocket() {
   if (evHubSocket?.readyState === WebSocket.OPEN) return Promise.resolve(evHubSocket);
   if (evHubConnecting) return evHubConnecting;
   const url = evHubBridgeConnectUrl();
+  const headers = {};
+  if (EV_HUB_PLATFORM_KEY) headers["X-Platform-Key"] = EV_HUB_PLATFORM_KEY;
   evHubConnecting = new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, { headers });
+    let pingTimer = null;
+    const stopPing = () => {
+      if (pingTimer) clearInterval(pingTimer);
+      pingTimer = null;
+    };
     ws.on("open", () => {
       evHubSocket = ws;
       evHubConnecting = null;
-      log(
-        "centralizer",
-        "·",
-        `ev-hub bridge open ${evHubBridgeUrl()}${EV_HUB_PROVIDER ? `?provider=${EV_HUB_PROVIDER}` : ""}`,
-      );
+      log("centralizer", "·", `ev-hub bridge open ${evHubBridgeUrl()}`);
+      // Keepalive so Cloudflare / proxies do not idle-drop the bridge (~100s).
+      pingTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          stopPing();
+          return;
+        }
+        try {
+          ws.ping();
+        } catch {
+          /* ignore */
+        }
+        try {
+          ws.send(JSON.stringify({ id: `ping-${Date.now()}`, action: "ping" }));
+        } catch {
+          /* ignore */
+        }
+      }, 25_000);
       flushEvHubEvents();
       resolve(ws);
     });
@@ -234,6 +262,7 @@ function ensureEvHubSocket() {
       }
     });
     ws.on("close", () => {
+      stopPing();
       if (evHubSocket === ws) evHubSocket = null;
       evHubConnecting = null;
       failEvHubPending(new Error("ev-hub bridge closed"));
@@ -309,6 +338,74 @@ function send(ws, frame) {
   if (ws.readyState === ws.OPEN) {
     ws.send(typeof frame === "string" ? frame : JSON.stringify(frame));
   }
+}
+
+/** Push platform JSON events onto the same /ocpp/{cpid} socket (Postman receive pane). */
+function emitToChargerSocket(chargePointId, event, data = {}) {
+  const charger = chargers.get(chargePointId);
+  if (!charger?.ws || charger.ws.readyState !== WebSocket.OPEN) return false;
+  send(charger.ws, {
+    ok: true,
+    event,
+    data: { chargePointId, ...data },
+  });
+  return true;
+}
+
+function stopPlatformMeterMirror(chargePointId) {
+  const charger = chargers.get(chargePointId);
+  if (!charger?.meterMirrorTimer) return;
+  clearInterval(charger.meterMirrorTimer);
+  charger.meterMirrorTimer = null;
+}
+
+/** After StartTransaction: push charger.meterValues on /ocpp/{cpid} every 5s. */
+function startPlatformMeterMirror(chargePointId, opts = {}) {
+  const charger = chargers.get(chargePointId);
+  if (!charger?.ws) return;
+  stopPlatformMeterMirror(chargePointId);
+
+  const connectorId = Number(opts.connectorId) || 1;
+  const transactionId = Number(opts.transactionId) || 0;
+  let energyWh = Number(opts.meterStart);
+  if (!Number.isFinite(energyWh) || energyWh < 0) energyWh = 0;
+
+  const tick = () => {
+    if (!chargers.get(chargePointId)?.ws) {
+      stopPlatformMeterMirror(chargePointId);
+      return;
+    }
+    energyWh += 150;
+    relayMeterValues(chargePointId, [
+      2,
+      "mirror",
+      "MeterValues",
+      {
+        connectorId,
+        transactionId: transactionId || undefined,
+        meterValue: [
+          {
+            timestamp: new Date().toISOString(),
+            sampledValue: [
+              {
+                value: String(energyWh),
+                measurand: "Energy.Active.Import.Register",
+                unit: "Wh",
+              },
+              {
+                value: "7.2",
+                measurand: "Power.Active.Import",
+                unit: "kW",
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+  };
+
+  tick();
+  charger.meterMirrorTimer = setInterval(tick, 5_000);
 }
 
 const pendingEvHubEvents = [];
@@ -568,6 +665,12 @@ function handleLocalCall(chargePointId, action, payload) {
       };
       sendToSubscribers(chargePointId, "charger.startTransaction", startData);
       sendToEvHub("charger.startTransaction", startData);
+      emitToChargerSocket(chargePointId, "charger.startTransaction", startData);
+      startPlatformMeterMirror(chargePointId, {
+        connectorId: Number(connectorId),
+        transactionId,
+        meterStart: Number(payload?.meterStart) || 0,
+      });
       return { idTagInfo: { status: "Accepted" }, transactionId };
     }
     case "StopTransaction": {
@@ -578,6 +681,7 @@ function handleLocalCall(chargePointId, action, payload) {
         }
       }
       log(chargePointId, "·", `transaction ${transactionId} stopped`);
+      stopPlatformMeterMirror(chargePointId);
       const stopData = {
         chargePointId,
         transactionId,
@@ -587,6 +691,7 @@ function handleLocalCall(chargePointId, action, payload) {
       };
       sendToSubscribers(chargePointId, "charger.stopTransaction", stopData);
       sendToEvHub("charger.stopTransaction", stopData);
+      emitToChargerSocket(chargePointId, "charger.stopTransaction", stopData);
       if (charger.transactions.size === 0) clearMeterSubscribers(chargePointId);
       return { idTagInfo: { status: "Accepted" } };
     }
@@ -622,6 +727,8 @@ function handleLocalCall(chargePointId, action, payload) {
 }
 
 function adoptLocalCharger(ws, chargePointId, platformAuthPassword) {
+  const previous = chargers.get(chargePointId);
+  if (previous?.meterMirrorTimer) clearInterval(previous.meterMirrorTimer);
   chargers.set(chargePointId, {
     ws,
     transactions: new Map(),
@@ -629,9 +736,14 @@ function adoptLocalCharger(ws, chargePointId, platformAuthPassword) {
     connectedAt: new Date(),
     mode: "local",
     platformAuthPassword,
+    meterMirrorTimer: null,
   });
   log(chargePointId, "·", "simulator connected (LOCAL CSMS)");
   notifyChargerConnected(chargePointId, "local", "local");
+  emitToChargerSocket(chargePointId, "connected", {
+    message: "Connected to virtual-server OCPP",
+    mode: "local",
+  });
 }
 
 function handleLocalOcppMessage(ws, chargePointId, message) {
@@ -695,7 +807,7 @@ async function handleChargerSocketCommand(ws, chargePointId, msg) {
 }
 
 function onChargerConnection(ws, chargePointId, platformAuthPassword = "") {
-  let adopted = false;
+  adoptLocalCharger(ws, chargePointId, platformAuthPassword);
 
   ws.on("message", (raw) => {
     let message;
@@ -707,28 +819,22 @@ function onChargerConnection(ws, chargePointId, platformAuthPassword = "") {
     }
 
     if (!Array.isArray(message)) {
-      if (adopted) return;
       handleChargerSocketCommand(ws, chargePointId, message).catch((error) =>
         send(ws, { ok: false, error: error.message || "Command failed" }),
       );
       return;
     }
 
-    if (!adopted) {
-      adopted = true;
-      adoptLocalCharger(ws, chargePointId, platformAuthPassword);
-    }
     handleLocalOcppMessage(ws, chargePointId, message);
   });
 
   ws.on("close", (code, reason) => {
-    if (adopted) {
-      const current = chargers.get(chargePointId);
-      if (current?.ws === ws) {
-        chargers.delete(chargePointId);
-        clearMeterSubscribers(chargePointId);
-        notifyChargerDisconnected(chargePointId);
-      }
+    const current = chargers.get(chargePointId);
+    if (current?.ws === ws) {
+      stopPlatformMeterMirror(chargePointId);
+      chargers.delete(chargePointId);
+      clearMeterSubscribers(chargePointId);
+      notifyChargerDisconnected(chargePointId);
     }
     log(chargePointId, "·", `disconnected ${code} ${reason?.toString?.() || ""}`);
   });
@@ -1420,23 +1526,74 @@ function handleCsmsEvent(msg) {
     ingestCsmsChargers(data.chargers);
     return;
   }
+  ingestEvHubChargerEvent(event, data);
+}
+
+/**
+ * Passive receive from Power Hub /bridge — no remoteStart required.
+ * Only charger status / presence (not meters). Debounced; never echo back to ev-hub.
+ */
+function ingestEvHubChargerEvent(event, data) {
+  const chargePointId = `${data?.chargePointId || ""}`.trim();
+  if (!event || !chargePointId) return;
+
   if (event === "charger.connected") {
-    rememberCsmsCharger(data.chargePointId, data);
+    if (!shouldSendBridge(`evhub-in:connected:${chargePointId}`)) return;
+    rememberCsmsCharger(chargePointId, data);
+    log(chargePointId, "·", `RECEIVED charger.connected`);
+    broadcastBridge(
+      "charger.connected",
+      { ...data, chargePointId, channel: "ev-hub" },
+      { localOnly: true },
+    );
     return;
   }
   if (event === "charger.disconnected") {
-    forgetCsmsCharger(data.chargePointId);
+    if (!shouldSendBridge(`evhub-in:disconnected:${chargePointId}`)) return;
+    forgetCsmsCharger(chargePointId);
+    log(chargePointId, "·", "RECEIVED charger.disconnected");
+    broadcastBridge(
+      "charger.disconnected",
+      { chargePointId, channel: "ev-hub" },
+      { localOnly: true },
+    );
     return;
   }
-  // MeterValues/StopTransaction for a charger that's physically connected to ev-hub
-  // (not here), forwarded back because this server sent remoteStart for it. Relay
-  // to whoever on this server's own /bridge subscribed via that remoteStart.
+  if (event === "charger.status") {
+    const connectorId = data.connectorId ?? "";
+    const status = data.status || "";
+    if (!shouldSendBridge(`evhub-in:status:${chargePointId}:${connectorId}:${status}`)) {
+      return;
+    }
+    log(
+      chargePointId,
+      "·",
+      `RECEIVED charger.status connector=${connectorId} status=${status}`,
+    );
+    broadcastBridge(
+      "charger.status",
+      { ...data, chargePointId, channel: "ev-hub" },
+      { localOnly: true },
+    );
+    return;
+  }
+  if (event === "charger.boot") {
+    if (!shouldSendBridge(`evhub-in:boot:${chargePointId}`)) return;
+    log(chargePointId, "·", `RECEIVED charger.boot`);
+    broadcastBridge(
+      "charger.boot",
+      { ...data, chargePointId, channel: "ev-hub" },
+      { localOnly: true },
+    );
+    return;
+  }
   if (
     event === "charger.meterValues" ||
     event === "charger.startTransaction" ||
     event === "charger.stopTransaction"
   ) {
     ingestMeterEvent(event, data);
+    broadcastBridge(event, { ...data, chargePointId, channel: "ev-hub" }, { localOnly: true });
   }
 }
 
@@ -1628,12 +1785,13 @@ function sendToSubscribers(chargePointId, event, data) {
   return sent;
 }
 
-function broadcastBridge(event, data) {
+function broadcastBridge(event, data, options = {}) {
   const frame = JSON.stringify({ ok: true, event, data });
   for (const client of bridgeClients) {
     if (client.readyState === client.OPEN) client.send(frame);
   }
-  sendToEvHub(event, data);
+  // Do not echo events that came FROM ev-hub back TO ev-hub (causes duplicate spam).
+  if (!options.localOnly) sendToEvHub(event, data);
 }
 
 const lastBridgeSendAt = new Map();
@@ -1686,6 +1844,9 @@ function relayMeterValues(chargePointId, frame) {
     meterValue: Array.isArray(payload.meterValue) ? payload.meterValue : [],
     payload,
   };
+  // Real MeterValues from the socket replace the auto-mirror ticks.
+  if (frame?.[1] !== "mirror") stopPlatformMeterMirror(chargePointId);
+  emitToChargerSocket(chargePointId, "charger.meterValues", meterData);
   const sent = sendToSubscribers(chargePointId, "charger.meterValues", meterData);
   const forwarded = sendToEvHub("charger.meterValues", meterData);
   if (charger?.lastMeterValues) {
@@ -1731,8 +1892,12 @@ function rememberStatus(chargePointId, payload) {
     updatedAt: new Date().toISOString(),
   };
   charger.connectorStatus.set(String(connectorId), record);
-  if (!shouldSendBridge(`status:${chargePointId}:${connectorId}:${status}`)) return;
   log(chargePointId, "·", `connector ${connectorId} status=${status}`);
+  emitToChargerSocket(chargePointId, "charger.status", {
+    connectorId,
+    ...record,
+  });
+  if (!shouldSendBridge(`status:${chargePointId}:${connectorId}:${status}`)) return;
   const channel = chargerChannel(chargePointId);
   broadcastBridge("charger.status", {
     chargePointId,
@@ -1757,6 +1922,7 @@ function rememberBoot(chargePointId, payload) {
     "·",
     `boot ${charger.boot.chargePointVendor || ""} ${charger.boot.chargePointModel || ""}`,
   );
+  emitToChargerSocket(chargePointId, "charger.boot", { ...charger.boot });
   if (!shouldSendBridge(`boot:${chargePointId}`)) return;
   broadcastBridge("charger.boot", {
     chargePointId,
@@ -1845,10 +2011,10 @@ server.on("upgrade", (request, socket, head) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   const publicOcpp = `${PUBLIC_URL.replace(/^http/i, "ws")}${WS_PATH}`;
-  console.log(`centralizer   virtual-server (local CSMS)`);
-  console.log(`OCPP WS       ws://0.0.0.0:${PORT}${WS_PATH}/{chargePointId}`);
+  console.log(`centralizer virtual-server (local CSMS)`);
+  console.log(`OCPP WS ws://0.0.0.0:${PORT}${WS_PATH}/{chargePointId}`);
   console.log(
-    `Public OCPP   ${publicOcpp}/{chargePointId}?platformAuthPassword=${SIMULATOR_MOCK_PASSWORD}`,
+    `Public OCPP ${publicOcpp}/{chargePointId}?platformAuthPassword=${SIMULATOR_MOCK_PASSWORD}`,
   );
   console.log(`simulator password ${SIMULATOR_MOCK_PASSWORD}`);
   console.log(`mock pricePerKwh ${localMockPrice()}`);

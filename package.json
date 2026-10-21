@@ -5,7 +5,9 @@
   "description": "OCPP 1.6 CSMS websocket for a charge-point simulator",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test:start": "bash scripts/start-shared.sh",
+    "test:stop": "bash scripts/stop-shared.sh"
   },
   "dependencies": {
     "ws": "^8.18.3"
