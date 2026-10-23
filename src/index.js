@@ -27,16 +27,42 @@ const HEARTBEAT_INTERVAL = Number(process.env.HEARTBEAT_INTERVAL || "60") || 60;
 const PUBLIC_URL = (
   process.env.PUBLIC_URL || "https://api-dev.pointhub.io"
 ).replace(/\/+$/, "");
-const EV_HUB_WS_BASE = (process.env.EV_HUB_WS_BASE || "")
-  .trim()
-  .replace(/\/+$/, "");
-const EV_HUB_BRIDGE_URL = (process.env.EV_HUB_BRIDGE_URL || "")
-  .trim()
-  .replace(/\/+$/, "");
+/** Power Hub master — shared-master control plane (not this lab's PUBLIC_URL). */
+const DEFAULT_EV_HUB_PROXY = "https://beta.power-hub.app";
+const DEFAULT_EV_HUB_BRIDGE = "wss://beta.power-hub.app/ocpp/bridge";
+const DEFAULT_EV_HUB_WS = "wss://beta.power-hub.app/ocpp";
+
+/**
+ * Env may still point EV_HUB_* at api-dev (this process). That self-loop fails
+ * (connect to …/ocpp without chargePointId). Prefer Power Hub when host matches us.
+ */
+function resolveEvHubUrl(raw, fallback) {
+  const value = `${raw || ""}`.trim().replace(/\/+$/, "");
+  if (!value) return fallback;
+  try {
+    const asHttp = value.replace(/^ws/i, "http");
+    const host = new URL(asHttp).host.toLowerCase();
+    const self = new URL(PUBLIC_URL).host.toLowerCase();
+    if (host && self && host === self) return fallback;
+  } catch {
+    /* keep value */
+  }
+  return value;
+}
+
+const EV_HUB_WS_BASE = resolveEvHubUrl(
+  process.env.EV_HUB_WS_BASE,
+  DEFAULT_EV_HUB_WS,
+);
+const EV_HUB_BRIDGE_URL = resolveEvHubUrl(
+  process.env.EV_HUB_BRIDGE_URL,
+  DEFAULT_EV_HUB_BRIDGE,
+);
 /** Shared-master HTTP control plane (never share master OCPP URL). */
-const EV_HUB_PROXY_URL = (process.env.EV_HUB_PROXY_URL || "")
-  .trim()
-  .replace(/\/+$/, "");
+const EV_HUB_PROXY_URL = resolveEvHubUrl(
+  process.env.EV_HUB_PROXY_URL,
+  DEFAULT_EV_HUB_PROXY,
+);
 const EV_HUB_PROVIDER = (process.env.EV_HUB_PROVIDER || "virtual-server").trim();
 const EV_HUB_PLATFORM_KEY = (process.env.EV_HUB_PLATFORM_KEY || "").trim();
 const SIMULATOR_MOCK_PASSWORD = (
@@ -107,6 +133,46 @@ function extractChargePointId(rawUrl) {
   }
 }
 
+/**
+ * Open lab OCPP: path /ocpp/{id}, /ocpp?chargePointId=, Basic username, or bare /ocpp.
+ * No password required.
+ */
+function resolveChargePointId(request) {
+  const fromPath = extractChargePointId(request.url);
+  if (fromPath) return fromPath;
+
+  try {
+    const parsed = new URL(request.url || "/", "http://localhost");
+    for (const key of ["chargePointId", "chargeBoxId", "cid", "id"]) {
+      const value = `${parsed.searchParams.get(key) || ""}`.trim();
+      if (value) return value;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const auth = `${request.headers?.authorization || ""}`.trim();
+  if (/^Basic\s+/i.test(auth)) {
+    try {
+      const decoded = Buffer.from(
+        auth.replace(/^Basic\s+/i, ""),
+        "base64",
+      ).toString("utf8");
+      const user = decoded.split(":")[0]?.trim();
+      if (user) return user;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const pathname = ((request.url || "/").split("?")[0] || "/").replace(/\/+$/, "") || "/";
+  // wss://host/ocpp  (no trailing id) — accept without permission
+  if (pathname === WS_PATH) {
+    return `OPEN-${randomUUID().slice(0, 8)}`;
+  }
+  return null;
+}
+
 function readPlatformAuthPassword(rawUrl) {
   try {
     const parsed = new URL(rawUrl || "/", "http://localhost");
@@ -127,25 +193,27 @@ function passwordsMatch(left, right) {
   return timingSafeEqual(a, b);
 }
 
-function chargerPasswordError(platformAuthPassword) {
-  const provided = `${platformAuthPassword || ""}`.trim();
-  if (!provided) return null;
-  if (passwordsMatch(provided, SIMULATOR_MOCK_PASSWORD)) return null;
-  return {
-    status: 401,
-    body: { ok: false, error: "Invalid platformAuthPassword" },
-  };
+/** Lab mode: OCPP / local start|stop accept any or missing password. */
+function chargerPasswordError(_platformAuthPassword) {
+  return null;
 }
 
 function evHubBridgeUrl() {
   const explicit = `${EV_HUB_BRIDGE_URL || ""}`.trim().replace(/\/+$/, "");
-  if (explicit) return explicit.endsWith("/bridge") ? explicit : `${explicit}/bridge`;
-  const fromOcpp = `${EV_HUB_WS_BASE || ""}`
-    .trim()
-    .replace(/\/+$/, "")
-    .replace(/\/ocpp$/i, "");
-  if (/^wss?:\/\//i.test(fromOcpp)) return `${fromOcpp}/bridge`;
-  throw new Error("EV_HUB_BRIDGE_URL is not configured");
+  if (explicit) {
+    if (/\/ocpp\/bridge$/i.test(explicit) || /\/bridge$/i.test(explicit)) {
+      return explicit;
+    }
+    if (/\/ocpp$/i.test(explicit)) return `${explicit}/bridge`;
+    return `${explicit}/ocpp/bridge`;
+  }
+  const fromOcpp = `${EV_HUB_WS_BASE || ""}`.trim().replace(/\/+$/, "");
+  if (/^wss?:\/\//i.test(fromOcpp)) {
+    if (/\/ocpp\/bridge$/i.test(fromOcpp)) return fromOcpp;
+    if (/\/ocpp$/i.test(fromOcpp)) return `${fromOcpp}/bridge`;
+    return `${fromOcpp}/ocpp/bridge`;
+  }
+  return DEFAULT_EV_HUB_BRIDGE;
 }
 
 function evHubBridgeConnectUrl() {
@@ -1985,7 +2053,7 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
-  const chargePointId = extractChargePointId(request.url);
+  const chargePointId = resolveChargePointId(request);
   if (!chargePointId) {
     log("centralizer", "·", `rejected OCPP upgrade (404): no chargePointId in "${request.url}"`);
     socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
@@ -1993,17 +2061,8 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
+  // Open OCPP: no password / permission — path, query, Basic user, or bare /ocpp.
   const platformAuthPassword = readPlatformAuthPassword(request.url);
-  if (!passwordsMatch(platformAuthPassword, SIMULATOR_MOCK_PASSWORD)) {
-    log(
-      chargePointId,
-      "·",
-      `rejected OCPP upgrade (401): platformAuthPassword did not match SIMULATOR_MOCK_PASSWORD`,
-    );
-    socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-    socket.destroy();
-    return;
-  }
   wss.handleUpgrade(request, socket, head, (ws) =>
     onChargerConnection(ws, chargePointId, platformAuthPassword),
   );
@@ -2013,10 +2072,7 @@ server.listen(PORT, "0.0.0.0", () => {
   const publicOcpp = `${PUBLIC_URL.replace(/^http/i, "ws")}${WS_PATH}`;
   console.log(`centralizer virtual-server (local CSMS)`);
   console.log(`OCPP WS ws://0.0.0.0:${PORT}${WS_PATH}/{chargePointId}`);
-  console.log(
-    `Public OCPP ${publicOcpp}/{chargePointId}?platformAuthPassword=${SIMULATOR_MOCK_PASSWORD}`,
-  );
-  console.log(`simulator password ${SIMULATOR_MOCK_PASSWORD}`);
+  console.log(`Public OCPP ${publicOcpp} (open — no password; id in path, ?chargePointId=, or bare /ocpp)`);
   console.log(`mock pricePerKwh ${localMockPrice()}`);
   console.log(`HTTP API      http://0.0.0.0:${PORT}/api/proxy`);
   console.log(`  POST /api/proxy/start`);
